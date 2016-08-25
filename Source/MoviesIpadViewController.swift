@@ -33,6 +33,7 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
     @IBOutlet weak var yearRangeSlider: TTRangeSlider!
     @IBOutlet weak var ratingSelectorView: RatingSelectorView!
     @IBOutlet weak var moviesCollectionView: UICollectionView!
+    @IBOutlet weak var moviesCollectionViewPlaceholder: UILabel!
     @IBOutlet weak var actorsTableView: UITableView!
     @IBOutlet weak var movieCountLabel: UILabel!
     @IBOutlet weak var searchTimeLabel: UILabel!
@@ -42,6 +43,7 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
 
     var actorSearcher: Searcher!
     var movieSearcher: Searcher!
+    var strategist: SearchStrategist!
     var actorHits: [[String: AnyObject]] = []
     var movieHits: [[String: AnyObject]] = []
     var genreFacets: [FacetValue] = []
@@ -85,12 +87,20 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
         movieSearcher.query.attributesToHighlight = ["title"]
         movieSearcher.query.hitsPerPage = 30
 
+        NSNotificationCenter.defaultCenter().addObserver(self, selector: #selector(self.updatePlaceholder), name: Searcher.SearchNotification, object: movieSearcher)
 
         // Track progress to update activity indicator.
         progressController = SearchProgressController(searcher: movieSearcher)
         progressController.delegate = self
         progressController.graceDelay = 0.5
 
+        strategist = SearchStrategist()
+        strategist.addSearcher(movieSearcher)
+        strategist.addSearcher(actorSearcher)
+        strategist.addObserver(self, forKeyPath: "strategy", options: .New, context: nil)
+        NSNotificationCenter.defaultCenter().addObserver(self, selector: #selector(self.requestDropped), name: SearchStrategist.DropNotification, object: strategist)
+        
+        updateMovies()
         search()
 
         // Start a sync if needed.
@@ -104,18 +114,35 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
     }
+    
+    // MARK: - State update
+    
+    private func updateMovies() {
+        moviesCollectionViewPlaceholder.hidden = !movieHits.isEmpty
+        if movieHits.isEmpty {
+            moviesCollectionViewPlaceholder.text = "No results"
+        }
+        moviesCollectionView.reloadData()
+    }
+    
+    private func updateStatusLabelColor() {
+        switch strategist.strategy {
+        case .Realtime: searchTimeLabel.textColor = UIColor.greenColor(); break
+        case .Throttled: searchTimeLabel.textColor = UIColor.purpleColor(); break
+        case .Manual: searchTimeLabel.textColor = UIColor.orangeColor(); break
+        }
+    }
 
     // MARK: - Actions
 
-    private func search() {
-        actorSearcher.search()
+    private func search(asYouType: Bool = false) {
         movieSearcher.disjunctiveFacets = genreFilteringModeSwitch.on ? ["genre"] : []
         movieSearcher.query.numericFilters = [
             "year >= \(Int(yearRangeSlider.selectedMinimum))",
             "year <= \(Int(yearRangeSlider.selectedMaximum))",
             "rating >= \(ratingSelectorView.rating)"
         ]
-        movieSearcher.search()
+        strategist.search(asYouType)
     }
 
     @IBAction func genreFilteringModeDidChange(sender: AnyObject) {
@@ -133,9 +160,13 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
     func searchBar(searchBar: UISearchBar, textDidChange searchText: String) {
         actorSearcher.query.query = searchText
         movieSearcher.query.query = searchText
+        search(true)
+    }
+    
+    func searchBarSearchButtonClicked(searchBar: UISearchBar) {
         search()
     }
-
+    
     // MARK: - Search completion handlers
 
     private func handleActorSearchResults(results: SearchResults?, error: NSError?) {
@@ -189,16 +220,15 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
         formatter.groupingSize = 3
         self.movieCountLabel.text = "\(formatter.stringFromNumber(results.nbHits)!) MOVIES"
 
-        searchTimeLabel.textColor = UIColor.lightGrayColor()
+        updateStatusLabelColor()
         self.searchTimeLabel.text = "Found in \(results.processingTimeMS) ms"
         // Indicate origin of content.
         if results.content["origin"] as? String == "local" {
-            searchTimeLabel.textColor = searchTimeLabel.highlightedTextColor
             searchTimeLabel.text! += " (offline results)"
         }
 
         self.genreTableView.reloadData()
-        self.moviesCollectionView.reloadData()
+        updateMovies()
 
         // Scroll to top.
         if results.page == 0 {
@@ -255,7 +285,7 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
         switch tableView {
             case genreTableView:
                 movieSearcher.toggleFacetRefinement("genre", value: genreFacets[indexPath.item].value)
-                movieSearcher.search()
+                strategist.search(false)
                 break
             default: return
         }
@@ -265,7 +295,7 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
 
     func rangeSlider(sender: TTRangeSlider!, didChangeSelectedMinimumValue selectedMinimum: Float, andMaximumValue selectedMaximum: Float) {
         yearFilterDebouncer.call {
-            self.search()
+            self.search(false)
         }
     }
 
@@ -277,9 +307,15 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
             if keyPath == "rating" {
                 search()
             }
+        } else if object === strategist {
+            if keyPath == "strategy" {
+                guard let strategy = change?[NSKeyValueChangeNewKey] as? Int else { return }
+                searchTimeLabel.text = "New strategy: \(strategy)"
+                updateStatusLabelColor()
+            }
         }
     }
-
+    
     // MARK: - Activity indicator
 
     func searchDidStart(searchProgressController: SearchProgressController) {
@@ -291,4 +327,23 @@ class MoviesIpadViewController: UIViewController, UICollectionViewDataSource, TT
         activityIndicator.stopAnimating()
         UIApplication.sharedApplication().networkActivityIndicatorVisible = false
     }
+
+    // MARK: - Events
+    
+    @objc private func requestDropped(notification: NSNotification) {
+        // Now that we have dropped a request, we should not display any results, as they won't correspond to the
+        // last entered text. => Cancel all pending requests.
+        movieSearcher.cancelPendingRequests()
+        actorHits.removeAll()
+        movieHits.removeAll()
+        actorsTableView.reloadData()
+        updateMovies()
+        moviesCollectionViewPlaceholder.text = "Press “Search” to see results…"
+    } ////
+    
+    @objc private func updatePlaceholder(notification: NSNotification) {
+        if notification.name == Searcher.SearchNotification {
+            moviesCollectionViewPlaceholder.text = "Searching…"
+        }
+    } ////
 }
